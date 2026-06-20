@@ -574,21 +574,23 @@ def build_artist(lf, sp, target_families=None):
 # TARGET GENRE PROFILE
 # ============================================================
 def build_target_profile(seeds):
-    """
-    Auto-derive the run's genre profile from seeds (or use TARGET_GENRES).
-    Always uses ALL seeds so the profile is as complete as possible even when
-    only a subset of seeds is later used for crawling.
-    """
     if TARGET_GENRES:
         return set(TARGET_GENRES)
+
     fams = set()
+
     for s in seeds:
         sp = get_spotify(s)
         lf = get_lastfm_info(s)
-        seed_fams = get_genre_families(lf.get("tags"), sp.get("genres"))
+
+        seed_fams = get_genre_families(
+            lf.get("tags"),
+            sp.get("genres")
+        )
+
+        fams.update(seed_fams)
+
     return fams
-
-
 # ============================================================
 # SEED SELECTION  (less deterministic, genre-aware subset)
 # ============================================================
@@ -1126,11 +1128,10 @@ def run_pipeline():
     print(f"Loaded {len(seeds)} seeds (API mode, no crawling).")
 
     # Only store seed NAMES in DB (no enrichment data)
-    app.state.seeds = seeds(
-        [{"name": s} for s in seeds],
-        score_threshold=10  # basically store all
-    )
-
+    save_seeds_bulk(
+    [{"name": s} for s in seeds],
+    score_threshold=0
+)
     print("Seed names stored. Switching to REQUEST-DRIVEN MODE.")
 
     # DO NOT crawl, DO NOT expand graph
@@ -1276,3 +1277,12 @@ score
 def trigger_pipeline():
     run_pipeline()
     return {"status": "pipeline started"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000))
+    )
