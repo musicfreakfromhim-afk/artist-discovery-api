@@ -13,17 +13,27 @@ import re
 import time
 import math
 import random
+import logging
 import unicodedata
 from collections import Counter
 from difflib import SequenceMatcher
 
 import requests
 import spotipy
+from dotenv import load_dotenv
 from spotipy.oauth2 import SpotifyClientCredentials
 from supabase import create_client
 
 
 # ===== APP =====
+load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("music-discovery-api")
+
 app = FastAPI()
 
 @app.get("/")
@@ -33,7 +43,6 @@ def home():
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 # ===== SUPABASE =====
 supabase = create_client(
@@ -50,13 +59,15 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 if not all([LASTFM_API_KEY, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET]):
     raise RuntimeError("Missing API credentials. Check your .env file.")
 
+# FIX 1: retries=0 prevents urllib3 from sleeping for Retry-After seconds on 429.
+# retries=3 was causing urllib3 to sleep 3 × 27198 s (~22 h) before raising.
 spotify = spotipy.Spotify(
     auth_manager=SpotifyClientCredentials(
         client_id=SPOTIFY_CLIENT_ID,
         client_secret=SPOTIFY_CLIENT_SECRET,
     ),
     requests_timeout=10,
-    retries=3,
+    retries=0,
 )
 
 LASTFM_URL = "http://ws.audioscrobbler.com/2.0/"
@@ -167,7 +178,7 @@ SEED_FANOUT            = 8
 SEED_MATCH_FRACTION = 0.70
 SEED_MIN_ACTIVE     = 3
 
-SEED_PROMOTION_SCORE   = 70     # minimum score to enter the seeds table
+SEED_PROMOTION_SCORE   = 50     # minimum score to enter the seeds table
 DB_MIN_RECOMMENDATIONS = 20     # minimum results before live supplement fires
 INCLUDE_SOCIALS        = False  # fetch MusicBrainz / Wikidata social links
 
@@ -274,11 +285,20 @@ def _lastfm_get(params):
             r    = SESSION.get(LASTFM_URL, params=params, timeout=HTTP_TIMEOUT)
             data = r.json()
             if isinstance(data, dict) and "error" in data:
+                logger.warning("_lastfm_get: Last.fm returned error for params=%s response=%s", params, data)
                 return None
             _lastfm_cache.set(_cache_key, data)
             return data
-        except (requests.RequestException, ValueError):
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning(
+                "_lastfm_get: request failed attempt=%s/%s params=%s error=%s",
+                attempt + 1,
+                MAX_RETRIES,
+                params,
+                exc,
+            )
             time.sleep(0.5 * (attempt + 1))
+    logger.warning("_lastfm_get: exhausted retries for params=%s", params)
     return None
 
 def _as_list(value):
@@ -318,22 +338,73 @@ def get_lastfm_info(artist):
 
 
 # ===== SPOTIFY =====
+SPOTIFY_COOLDOWN_UNTIL = 0
+SPOTIFY_COOLDOWN_FALLBACK = 30 * 60
+SPOTIFY_RATE_LIMITED = False
+
+def _empty_spotify_result():
+    return {"url": None, "image": None, "genres": [],
+            "popularity": 0, "followers": 0, "spotify_id": None,
+            "matched_name": None, "match_score": 0.0}
+
+def _spotify_retry_after_seconds(exc):
+    msg = str(exc)
+    match = re.search(r"Retry will occur after:\s*(\d+)\s*s", msg)
+    if match:
+        return _safe_int(match.group(1), SPOTIFY_COOLDOWN_FALLBACK)
+    response = getattr(exc, "http_response", None)
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    return _safe_int(retry_after, 0)
+
+def _is_spotify_rate_limit(exc):
+    status = getattr(exc, "http_status", None) or getattr(exc, "status", None)
+    return status == 429 or "429" in str(exc)
+
 def get_spotify(artist_name):
     """
     Search Spotify and pick the best-matching artist.
     Results are TTL-cached to avoid redundant API calls.
+    Failures are also cached so rate-limited calls are not retried within the TTL window.
     """
+    global SPOTIFY_COOLDOWN_UNTIL, SPOTIFY_RATE_LIMITED
     _cache_key = norm_key(artist_name)
     cached = _spotify_cache.get(_cache_key)
     if cached is not None:
         return cached
-    empty = {"url": None, "image": None, "genres": [],
-             "popularity": 0, "followers": 0, "spotify_id": None,
-             "matched_name": None, "match_score": 0.0}
+    empty = _empty_spotify_result()
+    now = time.time()
+    if SPOTIFY_RATE_LIMITED or now < SPOTIFY_COOLDOWN_UNTIL:
+        logger.warning(
+            "get_spotify: Spotify lookup skipped for %r because Spotify is rate-limited",
+            artist_name,
+        )
+        _spotify_cache.set(_cache_key, empty)
+        return empty
     try:
         time.sleep(RATE_LIMIT_SLEEP)
         items = spotify.search(q=artist_name, type="artist", limit=5)["artists"]["items"]
-    except Exception:
+    except Exception as exc:
+        if _is_spotify_rate_limit(exc):
+            retry_after = _spotify_retry_after_seconds(exc) or SPOTIFY_COOLDOWN_FALLBACK
+            SPOTIFY_RATE_LIMITED = True
+            SPOTIFY_COOLDOWN_UNTIL = max(
+                SPOTIFY_COOLDOWN_UNTIL,
+                time.time() + min(retry_after, SPOTIFY_COOLDOWN_FALLBACK)
+            )
+            logger.warning(
+                "get_spotify: Spotify 429 for %r; skipping all Spotify enrichment for this process. retry_after=%s error=%s",
+                artist_name,
+                retry_after,
+                exc,
+            )
+        else:
+            logger.warning(
+                "get_spotify: Spotify lookup failed for %r; skipping Spotify enrichment for this artist. error=%s",
+                artist_name,
+                exc,
+            )
+        _spotify_cache.set(_cache_key, empty)
         return empty
     if not items:
         _spotify_cache.set(_cache_key, empty)
@@ -654,6 +725,13 @@ def discover(seeds, depth=2, per_artist=12, sample_size=8, hard_cap=300,
 
 
 # ===== SAVE TO SUPABASE =====
+ARTIST_SELECT_COLUMNS = (
+    "name,spotify_id,genres,followers,popularity,"
+    "listeners,playcount,url,image,score,tags,genre_families,"
+    "growth_signal,growth_signal_reason,match_score,genre_match_score,"
+    "discovered_from"
+)
+
 def _artist_row(a):
     """Single source of truth for the artists table row format."""
     return {
@@ -661,10 +739,13 @@ def _artist_row(a):
         "spotify_id":           a.get("spotify_id"),
         "followers":            a.get("followers"),
         "popularity":           a.get("popularity"),
+        "listeners":            a.get("listeners"),
+        "playcount":            a.get("playcount"),
         "genres":               a.get("genres"),
         "tags":                 a.get("tags"),
         "score":                a.get("score"),
         "match_score":          a.get("match_score"),
+        "genre_match_score":    a.get("genre_match_score"),
         "genre_families":       list(a.get("genre_families", [])),
         "discovered_from":      a.get("discovered_from"),
         "growth_signal":        a.get("growth_signal"),
@@ -679,34 +760,92 @@ def save_artist(a):
 
 def save_artists_bulk(artists, batch_size=100):
     """Save all fields for a list of artists. Uses _artist_row as the single source of truth."""
+    if not artists:
+        logger.info("save_artists_bulk: Saving 0 artists")
+        return 0
     rows = [_artist_row(a) for a in artists]
+    logger.info("save_artists_bulk: Saving %s artists", len(rows))
+    saved = 0
     for i in range(0, len(rows), batch_size):
-        supabase.table("artists").upsert(
-            rows[i:i + batch_size],
-            on_conflict="name"
-        ).execute()
-    return len(rows)
+        batch = rows[i:i + batch_size]
+        try:
+            resp = supabase.table("artists").upsert(
+                batch,
+                on_conflict="name"
+            ).execute()
+            saved += len(batch)
+            logger.info(
+                "save_artists_bulk: Saved batch %s-%s (%s rows, response_rows=%s)",
+                i + 1,
+                i + len(batch),
+                len(batch),
+                len(resp.data or []),
+            )
+        except Exception as exc:
+            logger.exception(
+                "save_artists_bulk: failed saving artists batch %s-%s. Check artists table columns. error=%s",
+                i + 1,
+                i + len(batch),
+                exc,
+            )
+            raise
+    logger.info("save_artists_bulk: Saved %s artists", saved)
+    return saved
 
 def load_seeds_from_supabase():
     """Pull seed names from previous runs so the pool grows automatically."""
     try:
         resp = supabase.table("seeds").select("name").execute()
         return [row["name"] for row in (resp.data or []) if row.get("name")]
-    except Exception:
-        return []
+    except Exception as exc:
+        logger.exception("load_seeds_from_supabase: failed loading seeds: %s", exc)
+        raise
 
 def save_seeds_bulk(artists, score_threshold=SEED_PROMOTION_SCORE, batch_size=100):
     """Promote high-quality underground artists into the seeds table."""
+    in_scope = [a for a in artists if is_within_discovery_scope(a)]
+    qualified = [a for a in in_scope if a.get("score", 0) >= score_threshold]
     rows = [
         {"name": a["name"]}
-        for a in artists
-        if is_within_discovery_scope(a) and a.get("score", 0) >= score_threshold
+        for a in qualified
     ]
+    if artists:
+        print(
+            f"Seed promotion check: {len(in_scope)}/{len(artists)} in scope, "
+            f"{len(qualified)} score >= {score_threshold}."
+        )
     for i in range(0, len(rows), batch_size):
-        supabase.table("seeds").upsert(
-            rows[i:i + batch_size], on_conflict="name"
-        ).execute()
+        batch = rows[i:i + batch_size]
+        try:
+            supabase.table("seeds").upsert(
+                batch, on_conflict="name"
+            ).execute()
+        except Exception as exc:
+            logger.exception(
+                "save_seeds_bulk: failed saving seeds batch %s-%s: %s",
+                i + 1,
+                i + len(batch),
+                exc,
+            )
+            raise
     return len(rows)
+
+
+def select_artist_rows_for_search(q):
+    try:
+        rows = (
+            supabase.table("artists")
+            .select(ARTIST_SELECT_COLUMNS)
+            .ilike("name", f"%{q}%")
+            .order("score", desc=True)
+            .limit(50)
+            .execute()
+        ).data or []
+        logger.info("select_artist_rows_for_search: Database returned %s artists for query=%r", len(rows), q)
+        return rows
+    except Exception as exc:
+        logger.exception("select_artist_rows_for_search: search query failed for query=%r: %s", q, exc)
+        raise
 
 
 # ===== DB RECOMMENDATION LOADER =====
@@ -721,9 +860,9 @@ def load_recommendations_from_db(target_families=None, min_score=40, limit=200):
             .limit(limit)
             .execute()
         ).data or []
-    except Exception as e:
-        print(f"Warning: DB load failed: {e}")
-        return []
+    except Exception as exc:
+        logger.exception("load_recommendations_from_db: DB load failed: %s", exc)
+        raise
 
     artists = []
     for row in rows:
@@ -736,8 +875,8 @@ def load_recommendations_from_db(target_families=None, min_score=40, limit=200):
             "genres":               row.get("genres") or [],
             "url":                  row.get("url"),
             "image":                row.get("image"),
-            "popularity":           row.get("popularity", 0),    # column is "popularity"
-            "followers":            row.get("followers", 0),     # column is "followers"
+            "popularity":           row.get("popularity", 0),
+            "followers":            row.get("followers", 0),
             "spotify_id":           row.get("spotify_id"),
             "match_score":          row.get("match_score", 0.0),
             "score":                row.get("score", 0),
@@ -767,8 +906,13 @@ def live_search_supplement(seeds, target_families, needed,
     so every discovery pass makes future runs smarter.
     """
     sample = seeds[:min(3, len(seeds))]
-    print(f"\nLive search supplement: {len(sample)} seed(s), "
-          f"depth={depth}, cap={hard_cap} (need ~{needed} more).\n")
+    logger.info(
+        "live_search_supplement: Starting discovery with %s seed(s), depth=%s, cap=%s, need~%s",
+        len(sample),
+        depth,
+        hard_cap,
+        needed,
+    )
     raw = discover(
         sample,
         depth=depth,
@@ -781,21 +925,36 @@ def live_search_supplement(seeds, target_families, needed,
         expand_top_fraction=0.5,
         seed_fanout=4,
     )
+    logger.info("live_search_supplement: Discovered %s raw artists", len(raw))
     enriched = []
     for c in raw:
         key = norm_key(c["name"])
         if key in _artist_discovery_cache:
             enriched.append(_artist_discovery_cache[key])
             continue
-        sp = c.get("_spotify") or get_spotify(c["name"])
+        # FIX 4: an empty dict {"spotify_id": None, ...} is truthy in Python,
+        # so the old `or` idiom never retried failed lookups.
+        # Check spotify_id explicitly instead.
+        sp = c.get("_spotify")
+        if not (sp and sp.get("spotify_id")):
+            sp = get_spotify(c["name"])
         a  = build_artist(c, sp, target_families)
         _artist_discovery_cache[key] = a
         enriched.append(a)
+    logger.info("live_search_supplement: Enriched %s artists", len(enriched))
     valid = [a for a in enriched if is_within_discovery_scope(a)]
+    logger.info(
+        "live_search_supplement: %s/%s artists are within discovery scope",
+        len(valid),
+        len(enriched),
+    )
     if valid:
+        logger.info("live_search_supplement: Saving %s artists", len(valid))
         n = save_artists_bulk(valid)
         save_seeds_bulk(valid)   # promote high-scorers to seeds
-        print(f"Live search supplement saved {n} new artists to DB.")
+        logger.info("live_search_supplement: Saved %s artists", n)
+    else:
+        logger.info("live_search_supplement: Saving 0 artists")
     return enriched
 
 
@@ -835,8 +994,8 @@ def _mb_url_relations(mbid):
         )
         if r.status_code == 200:
             return r.json().get("relations", [])
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_mb_url_relations: failed for mbid=%r error=%s", mbid, exc)
     return []
 
 def _wikidata_socials(qid):
@@ -852,7 +1011,8 @@ def _wikidata_socials(qid):
         if r.status_code != 200:
             return {}
         claims = (r.json().get("entities", {}).get(qid, {}).get("claims", {}))
-    except Exception:
+    except Exception as exc:
+        logger.warning("_wikidata_socials: failed for qid=%r error=%s", qid, exc)
         return {}
     def _first_val(prop):
         snaks = claims.get(prop, [])
@@ -938,9 +1098,9 @@ def run_pipeline():
     candidates = discover(
         active_seeds,
         depth=3,
-        per_artist=12,
+        per_artist=5,
         sample_size=8,
-        hard_cap=300,
+        hard_cap=100,
         max_per_origin=40,
         target_families=target_families,
         expand_score_threshold=EXPAND_SCORE_THRESHOLD,
@@ -950,7 +1110,12 @@ def run_pipeline():
 
     enriched = []
     for c in candidates:
-        sp  = c.get("_spotify") or get_spotify(c["name"])
+        # FIX 3: an empty dict {"spotify_id": None, ...} is truthy in Python,
+        # so the old `or` idiom never retried failed Spotify lookups from the
+        # crawl phase.  Check spotify_id explicitly instead.
+        sp = c.get("_spotify")
+        if not (sp and sp.get("spotify_id")):
+            sp = get_spotify(c["name"])
         a   = build_artist(c, sp, target_families)
         key = norm_key(a["name"])
         if key:
@@ -1012,79 +1177,112 @@ def run_pipeline():
 # ===== STARTUP =====
 @app.on_event("startup")
 def startup():
-    print("API started — search is live, use POST /run to trigger full discovery.")
+    app.state.pipeline_running = False
+    app.state.search_discovery_running = set()
+    logger.info("startup: API started; search is live, use POST /run to trigger full discovery")
 
 
 # ===== ENDPOINTS =====
-@app.get("/search")
-def search_artists(q: str = Query(...)):
-    """
-    Search artists by name.
-    Returns DB results immediately. If fewer than SEARCH_MIN_RESULTS exist,
-    runs a small live discovery pass using the query as a seed, saves the
-    results, and returns the combined list — enriching the DB on every search.
-    """
-    # 1. Query the database (substring match, sorted by score).
-    db_rows = (
-        supabase.table("artists")
-        .select("name,spotify_id,genres,followers,popularity,"
-                "url,image,score,tags,genre_families,"
-                "growth_signal,growth_signal_reason,match_score,discovered_from")
-        .ilike("name", f"%{q}%")
-        .order("score", desc=True)
-        .limit(50)
-        .execute()
-    ).data or []
+def run_pipeline_guarded():
+    try:
+        run_pipeline()
+    except Exception as exc:
+        logger.exception("run_pipeline_guarded: Pipeline failed: %s", exc)
+        raise
+    finally:
+        app.state.pipeline_running = False
 
-    results = list(db_rows)
-
-    # 2. If too few results, run a small live discovery pass.
-    if len(results) < SEARCH_MIN_RESULTS:
-        sp        = get_spotify(q)
-        seed_name = sp.get("matched_name") or q
-        needed    = SEARCH_MIN_RESULTS - len(results)
-
-        live = live_search_supplement(
-            [seed_name],
-            target_families=set(),   # neutral scoring when genre profile is unknown
-            needed=needed,
+def run_search_discovery_guarded(query):
+    key = norm_key(query)
+    try:
+        logger.info("run_search_discovery_guarded: Starting discovery for query=%r", query)
+        live_search_supplement(
+            [query],
+            target_families=set(),
+            needed=SEARCH_MIN_RESULTS,
             depth=1,
             per_artist=8,
             hard_cap=40,
         )
+        logger.info("run_search_discovery_guarded: Finished discovery for query=%r", query)
+    except Exception as exc:
+        logger.exception("run_search_discovery_guarded: discovery failed for query=%r: %s", query, exc)
+    finally:
+        running = getattr(app.state, "search_discovery_running", set())
+        running.discard(key)
 
-        # Merge live results, skipping anything already in the DB response.
-        existing = {norm_key(r.get("name", "")) for r in results}
-        for a in live:
-            if not is_within_discovery_scope(a):
-                continue
-            if norm_key(a["name"]) in existing:
-                continue
-            results.append({
-                "name":                 a["name"],
-                "spotify_id":           a.get("spotify_id"),
-                "genres":               a.get("genres"),
-                "followers":            a.get("followers"),
-                "popularity":           a.get("popularity"),
-                "url":                  a.get("url"),
-                "image":                a.get("image"),
-                "score":                a.get("score"),
-                "tags":                 a.get("tags"),
-                "genre_families":       a.get("genre_families"),
-                "growth_signal":        a.get("growth_signal"),
-                "growth_signal_reason": a.get("growth_signal_reason"),
-                "match_score":          a.get("match_score"),
-                "discovered_from":      a.get("discovered_from"),
-            })
+@app.get("/search")
+def search_artists(background_tasks: BackgroundTasks, q: str = Query(...)):
+    """
+    Search artists by name.
+    Returns DB results immediately. If fewer than SEARCH_MIN_RESULTS exist, a
+    small discovery pass is queued in the background so future searches improve
+    without blocking the current request on Spotify or Last.fm.
+    """
+    logger.info("search_artists: request received query=%r", q)
+    db_rows = select_artist_rows_for_search(q)
+    results = list(db_rows)
+    logger.info("search_artists: Database returned %s artists", len(results))
+
+    if len(results) < SEARCH_MIN_RESULTS:
+        running = getattr(app.state, "search_discovery_running", set())
+        key = norm_key(q)
+        if key and key not in running:
+            running.add(key)
+            app.state.search_discovery_running = running
+            logger.info(
+                "search_artists: Starting discovery in background for query=%r because DB returned %s/%s artists",
+                q,
+                len(results),
+                SEARCH_MIN_RESULTS,
+            )
+            background_tasks.add_task(run_search_discovery_guarded, q)
+        else:
+            logger.info("search_artists: Discovery already running for query=%r", q)
+    else:
+        logger.info("search_artists: DB has enough results; no discovery queued")
 
     results.sort(key=lambda x: x.get("score") or 0, reverse=True)
+    logger.info("search_artists: Returning %s artists", len(results[:50]))
     return {"query": q, "count": len(results), "results": results[:50]}
+
+
+@app.get("/run")
+def trigger_pipeline_from_browser(background_tasks: BackgroundTasks):
+    """Browser-friendly alias for manual testing."""
+    return _trigger_pipeline(background_tasks, source="GET /run")
 
 
 @app.post("/run")
 def trigger_pipeline(background_tasks: BackgroundTasks):
     """Trigger the full discovery pipeline in the background (non-blocking)."""
-    background_tasks.add_task(run_pipeline)
+    return _trigger_pipeline(background_tasks, source="POST /run")
+
+
+@app.get("/status")
+def status():
+    """Quick operational status for Railway/manual testing."""
+    return {
+        "ok": True,
+        "pipeline_running": getattr(app.state, "pipeline_running", False),
+        "search_discovery_running": sorted(
+            getattr(app.state, "search_discovery_running", set())
+        ),
+        "spotify_rate_limited": SPOTIFY_RATE_LIMITED,
+        "spotify_cooldown_remaining_seconds": max(
+            0,
+            int(SPOTIFY_COOLDOWN_UNTIL - time.time()),
+        ),
+    }
+
+
+def _trigger_pipeline(background_tasks, source):
+    if getattr(app.state, "pipeline_running", False):
+        logger.info("trigger_pipeline: pipeline already running source=%s", source)
+        return {"status": "pipeline already running"}
+    app.state.pipeline_running = True
+    logger.info("trigger_pipeline: pipeline started source=%s", source)
+    background_tasks.add_task(run_pipeline_guarded)
     return {"status": "pipeline started"}
 
 
@@ -1093,5 +1291,5 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000))
+        port=int(os.environ.get("PORT", 8080))
     )
