@@ -4,7 +4,8 @@ Music discovery pipeline (Last.fm BFS crawl -> Spotify enrichment -> scoring).
 UNDERGROUND-ONLY MODE:
   - Hard Spotify gates DURING the crawl (followers > 50k OR popularity > 50 => skip).
   - No probabilities, no overrides, no "occasionally allow bigger artists".
-  - Large artists are never saved AND never propagated (graph stops there).
+  - Large artists are never saved.
+  - Large artists may be used as bridge nodes so the graph can reach smaller related artists.
 """
 
 from fastapi import FastAPI, Query, BackgroundTasks
@@ -34,7 +35,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("music-discovery-api")
 
-APP_VERSION = "codex-stabilized-2026-06-21-v2"
+APP_VERSION = "codex-stabilized-2026-06-21-v5"
 
 app = FastAPI()
 
@@ -48,13 +49,27 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": APP_VERSION}
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "configured": {
+            "supabase": supabase is not None,
+            "lastfm": bool(LASTFM_API_KEY),
+            "spotify": spotify is not None,
+        },
+    }
 
 # ===== SUPABASE =====
-supabase = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
-)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as exc:
+        logger.exception("startup: failed to create Supabase client: %s", exc)
+else:
+    logger.warning("startup: Supabase is not configured; DB reads/writes will be skipped")
 
 
 # ===== CONFIG / KEYS =====
@@ -62,19 +77,22 @@ LASTFM_API_KEY        = os.getenv("LASTFM_API_KEY")
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
-if not all([LASTFM_API_KEY, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET]):
-    raise RuntimeError("Missing API credentials. Check your .env file.")
+if not LASTFM_API_KEY:
+    logger.warning("startup: LASTFM_API_KEY is missing; Last.fm calls will return fallbacks")
 
-# FIX 1: retries=0 prevents urllib3 from sleeping for Retry-After seconds on 429.
-# retries=3 was causing urllib3 to sleep 3 × 27198 s (~22 h) before raising.
-spotify = spotipy.Spotify(
-    auth_manager=SpotifyClientCredentials(
-        client_id=SPOTIFY_CLIENT_ID,
-        client_secret=SPOTIFY_CLIENT_SECRET,
-    ),
-    requests_timeout=10,
-    retries=0,
-)
+spotify = None
+if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+    # retries=0 prevents urllib3 from sleeping for Retry-After seconds on 429.
+    spotify = spotipy.Spotify(
+        auth_manager=SpotifyClientCredentials(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET,
+        ),
+        requests_timeout=10,
+        retries=0,
+    )
+else:
+    logger.warning("startup: Spotify credentials are missing; Spotify enrichment will be skipped")
 
 LASTFM_URL = "http://ws.audioscrobbler.com/2.0/"
 
@@ -174,6 +192,7 @@ DISCOVERY_ABS_MAX      = 50_000
 
 MAX_SPOTIFY_FOLLOWERS  = 50_000
 MAX_SPOTIFY_POPULARITY = 50
+ALLOW_BIG_ARTIST_BRIDGES = True
 
 # ===== EXPANSION POLICY =====
 EXPAND_SCORE_THRESHOLD = 65
@@ -280,6 +299,9 @@ def genre_match_score(artist_families, target_families):
 
 # ===== LAST.FM =====
 def _lastfm_get(params):
+    if not LASTFM_API_KEY:
+        logger.warning("_lastfm_get: LASTFM_API_KEY missing; params=%s", params)
+        return None
     _cache_key = tuple(sorted(params.items()))
     cached = _lastfm_cache.get(_cache_key)
     if cached is not None:
@@ -379,6 +401,10 @@ def get_spotify(artist_name):
     if cached is not None:
         return cached
     empty = _empty_spotify_result()
+    if spotify is None:
+        logger.warning("get_spotify: Spotify client is not configured; artist=%r", artist_name)
+        _spotify_cache.set(_cache_key, empty)
+        return empty
     now = time.time()
     if SPOTIFY_RATE_LIMITED or now < SPOTIFY_COOLDOWN_UNTIL:
         logger.warning(
@@ -649,6 +675,13 @@ def discover(seeds, depth=2, per_artist=12, sample_size=8, hard_cap=300,
     keep          = []
     origin_counts = Counter()
     frontier, seen_frontier = [], set()
+    stats = {
+        "scanned": 0,
+        "kept": 0,
+        "bridge_too_big": 0,
+        "skipped_too_big": 0,
+        "skipped_out_of_scope": 0,
+    }
 
     for s in seeds:
         disp = primary_artist_name(s)
@@ -678,12 +711,15 @@ def discover(seeds, depth=2, per_artist=12, sample_size=8, hard_cap=300,
             lf["_spotify"]  = sp
             followers       = sp.get("followers", 0)
             popularity      = sp.get("popularity", 0)
+            stats["scanned"] += 1
 
             if is_too_big(sp):
-                if level == 0:
-                    print(f"  seed-node (not saved): {lf['name']} "
+                stats["skipped_too_big"] += 1
+                if ALLOW_BIG_ARTIST_BRIDGES:
+                    stats["bridge_too_big"] += 1
+                    print(f"  BRIDGE (too big, not saved): {lf['name']} "
                           f"(followers={followers}, pop={popularity})")
-                    scored_nodes.append((-1, lf, lf["name"], origin, full_path))
+                    scored_nodes.append((0, lf, lf["name"], origin, full_path))
                 else:
                     print(f"  STOP (too big): {lf['name']} "
                           f"(followers={followers}, pop={popularity})")
@@ -693,6 +729,9 @@ def discover(seeds, depth=2, per_artist=12, sample_size=8, hard_cap=300,
                    origin_counts[origin] < max_per_origin:
                     keep.append(lf)
                     origin_counts[origin] += 1
+                    stats["kept"] += 1
+                else:
+                    stats["skipped_out_of_scope"] += 1
                 a = build_artist(lf, sp, target_families)
                 scored_nodes.append((a["score"], lf, lf["name"], origin, full_path))
 
@@ -727,21 +766,53 @@ def discover(seeds, depth=2, per_artist=12, sample_size=8, hard_cap=300,
         else:
             frontier = []
 
+    logger.info(
+        "discover: scanned=%s kept=%s bridge_too_big=%s skipped_too_big=%s skipped_out_of_scope=%s",
+        stats["scanned"],
+        stats["kept"],
+        stats["bridge_too_big"],
+        stats["skipped_too_big"],
+        stats["skipped_out_of_scope"],
+    )
     return keep
 
 
 # ===== SAVE TO SUPABASE =====
 ARTIST_SELECT_COLUMNS = (
-    "name,spotify_id,genres,followers,popularity,"
+    "name,mbid,spotify_id,genres,followers,popularity,"
     "listeners,playcount,url,image,score,tags,genre_families,"
-    "growth_signal,growth_signal_reason,match_score,genre_match_score,"
+    "growth_signal,growth_signal_reason,match_score,genre_match_score,score_breakdown,"
     "discovered_from"
 )
+
+REQUIRED_ARTIST_COLUMNS = {"name"}
+OPTIONAL_ARTIST_COLUMNS = {
+    "mbid", "spotify_id", "followers", "popularity", "listeners", "playcount",
+    "genres", "tags", "score", "score_breakdown", "match_score",
+    "genre_match_score", "genre_families", "discovered_from", "growth_signal",
+    "growth_signal_reason", "url", "image",
+}
+
+def _missing_db_columns(exc):
+    msg = str(exc)
+    return {
+        col for col in (REQUIRED_ARTIST_COLUMNS | OPTIONAL_ARTIST_COLUMNS)
+        if col in msg
+    }
+
+def _drop_columns(rows, columns):
+    if not columns:
+        return rows
+    return [
+        {k: v for k, v in row.items() if k not in columns}
+        for row in rows
+    ]
 
 def _artist_row(a):
     """Single source of truth for the artists table row format."""
     return {
         "name":                 a["name"],
+        "mbid":                 a.get("mbid"),
         "spotify_id":           a.get("spotify_id"),
         "followers":            a.get("followers"),
         "popularity":           a.get("popularity"),
@@ -750,6 +821,7 @@ def _artist_row(a):
         "genres":               a.get("genres"),
         "tags":                 a.get("tags"),
         "score":                a.get("score"),
+        "score_breakdown":      a.get("score_breakdown") or {},
         "match_score":          a.get("match_score"),
         "genre_match_score":    a.get("genre_match_score"),
         "genre_families":       list(a.get("genre_families", [])),
@@ -769,14 +841,18 @@ def save_artists_bulk(artists, batch_size=100):
     if not artists:
         logger.info("save_artists_bulk: Saving 0 artists")
         return 0
+    if supabase is None:
+        logger.error("save_artists_bulk: Supabase is not configured; skipped saving %s artists", len(artists))
+        return 0
     rows = [_artist_row(a) for a in artists]
     logger.info("save_artists_bulk: Saving %s artists", len(rows))
     saved = 0
+    disabled_optional_columns = set()
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         try:
             resp = supabase.table("artists").upsert(
-                batch,
+                _drop_columns(batch, disabled_optional_columns),
                 on_conflict="name"
             ).execute()
             saved += len(batch)
@@ -788,27 +864,66 @@ def save_artists_bulk(artists, batch_size=100):
                 len(resp.data or []),
             )
         except Exception as exc:
+            missing = _missing_db_columns(exc)
+            missing_required = missing & REQUIRED_ARTIST_COLUMNS
+            missing_optional = missing & OPTIONAL_ARTIST_COLUMNS
+            if missing_optional and not missing_required:
+                disabled_optional_columns |= missing_optional
+                logger.exception(
+                    "save_artists_bulk: artists table missing optional column(s) %s; retrying batch without them. error=%s",
+                    sorted(missing_optional),
+                    exc,
+                )
+                try:
+                    resp = supabase.table("artists").upsert(
+                        _drop_columns(batch, disabled_optional_columns),
+                        on_conflict="name"
+                    ).execute()
+                    saved += len(batch)
+                    logger.info(
+                        "save_artists_bulk: Saved batch %s-%s after dropping optional columns %s (response_rows=%s)",
+                        i + 1,
+                        i + len(batch),
+                        sorted(disabled_optional_columns),
+                        len(resp.data or []),
+                    )
+                    continue
+                except Exception as retry_exc:
+                    logger.exception(
+                        "save_artists_bulk: retry failed for batch %s-%s after dropping optional columns %s: %s",
+                        i + 1,
+                        i + len(batch),
+                        sorted(disabled_optional_columns),
+                        retry_exc,
+                    )
+                    continue
             logger.exception(
                 "save_artists_bulk: failed saving artists batch %s-%s. Check artists table columns. error=%s",
                 i + 1,
                 i + len(batch),
                 exc,
             )
-            raise
+            continue
     logger.info("save_artists_bulk: Saved %s artists", saved)
     return saved
 
 def load_seeds_from_supabase():
     """Pull seed names from previous runs so the pool grows automatically."""
+    if supabase is None:
+        logger.error("load_seeds_from_supabase: Supabase is not configured")
+        return []
     try:
         resp = supabase.table("seeds").select("name").execute()
         return [row["name"] for row in (resp.data or []) if row.get("name")]
     except Exception as exc:
         logger.exception("load_seeds_from_supabase: failed loading seeds: %s", exc)
-        raise
+        return []
 
 def save_seeds_bulk(artists, score_threshold=SEED_PROMOTION_SCORE, batch_size=100):
     """Promote high-quality underground artists into the seeds table."""
+    if supabase is None:
+        logger.error("save_seeds_bulk: Supabase is not configured; skipped seed promotion")
+        return 0
     in_scope = [a for a in artists if is_within_discovery_scope(a)]
     qualified = [a for a in in_scope if a.get("score", 0) >= score_threshold]
     rows = [
@@ -820,12 +935,14 @@ def save_seeds_bulk(artists, score_threshold=SEED_PROMOTION_SCORE, batch_size=10
             f"Seed promotion check: {len(in_scope)}/{len(artists)} in scope, "
             f"{len(qualified)} score >= {score_threshold}."
         )
+    saved = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         try:
             supabase.table("seeds").upsert(
                 batch, on_conflict="name"
             ).execute()
+            saved += len(batch)
         except Exception as exc:
             logger.exception(
                 "save_seeds_bulk: failed saving seeds batch %s-%s: %s",
@@ -833,11 +950,14 @@ def save_seeds_bulk(artists, score_threshold=SEED_PROMOTION_SCORE, batch_size=10
                 i + len(batch),
                 exc,
             )
-            raise
-    return len(rows)
+            continue
+    return saved
 
 
 def select_artist_rows_for_search(q):
+    if supabase is None:
+        logger.error("select_artist_rows_for_search: Supabase is not configured; query=%r", q)
+        return []
     try:
         rows = (
             supabase.table("artists")
@@ -851,12 +971,15 @@ def select_artist_rows_for_search(q):
         return rows
     except Exception as exc:
         logger.exception("select_artist_rows_for_search: search query failed for query=%r: %s", q, exc)
-        raise
+        return []
 
 
 # ===== DB RECOMMENDATION LOADER =====
 def load_recommendations_from_db(target_families=None, min_score=40, limit=200):
     """Load previously discovered artists from Supabase."""
+    if supabase is None:
+        logger.error("load_recommendations_from_db: Supabase is not configured")
+        return []
     try:
         rows = (
             supabase.table("artists")
@@ -868,13 +991,13 @@ def load_recommendations_from_db(target_families=None, min_score=40, limit=200):
         ).data or []
     except Exception as exc:
         logger.exception("load_recommendations_from_db: DB load failed: %s", exc)
-        raise
+        return []
 
     artists = []
     for row in rows:
         a = {
             "name":                 row.get("name", ""),
-            "mbid":                 None,
+            "mbid":                 row.get("mbid"),
             "listeners":            row.get("listeners", 0),
             "playcount":            row.get("playcount", 0),
             "tags":                 row.get("tags") or [],
@@ -886,7 +1009,7 @@ def load_recommendations_from_db(target_families=None, min_score=40, limit=200):
             "spotify_id":           row.get("spotify_id"),
             "match_score":          row.get("match_score", 0.0),
             "score":                row.get("score", 0),
-            "score_breakdown":      {},
+            "score_breakdown":      row.get("score_breakdown") or {},
             "discovered_from":      row.get("discovered_from"),
             "growth_signal":        row.get("growth_signal", 0),
             "growth_signal_reason": row.get("growth_signal_reason", "stable"),
@@ -1233,12 +1356,16 @@ def search_artists(background_tasks: BackgroundTasks, q: str = Query(...)):
     results = list(db_rows)
     logger.info("search_artists: Database returned %s artists", len(results))
 
+    discovery_queued = False
+    discovery_already_running = False
+
     if len(results) < SEARCH_MIN_RESULTS:
         running = getattr(app.state, "search_discovery_running", set())
         key = norm_key(q)
         if key and key not in running:
             running.add(key)
             app.state.search_discovery_running = running
+            discovery_queued = True
             logger.info(
                 "search_artists: Starting discovery in background for query=%r because DB returned %s/%s artists",
                 q,
@@ -1247,13 +1374,20 @@ def search_artists(background_tasks: BackgroundTasks, q: str = Query(...)):
             )
             background_tasks.add_task(run_search_discovery_guarded, q)
         else:
+            discovery_already_running = True
             logger.info("search_artists: Discovery already running for query=%r", q)
     else:
         logger.info("search_artists: DB has enough results; no discovery queued")
 
     results.sort(key=lambda x: x.get("score") or 0, reverse=True)
     logger.info("search_artists: Returning %s artists", len(results[:50]))
-    return {"query": q, "count": len(results), "results": results[:50]}
+    return {
+        "query": q,
+        "count": len(results),
+        "results": results[:50],
+        "discovery_queued": discovery_queued,
+        "discovery_already_running": discovery_already_running,
+    }
 
 
 @app.get("/run")
@@ -1273,6 +1407,12 @@ def status():
     """Quick operational status for Railway/manual testing."""
     return {
         "ok": True,
+        "version": APP_VERSION,
+        "configured": {
+            "supabase": supabase is not None,
+            "lastfm": bool(LASTFM_API_KEY),
+            "spotify": spotify is not None,
+        },
         "pipeline_running": getattr(app.state, "pipeline_running", False),
         "search_discovery_running": sorted(
             getattr(app.state, "search_discovery_running", set())

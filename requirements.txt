@@ -1,7 +1,6 @@
-fastapi
-uvicorn
-spotipy
-supabase
-requests
-python-dotenv
-numpy
+fastapi==0.138.0
+uvicorn==0.49.0
+spotipy==2.26.0
+supabase==2.31.0
+requests==2.34.2
+python-dotenv==1.2.2
