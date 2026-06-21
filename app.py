@@ -34,15 +34,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("music-discovery-api")
 
+APP_VERSION = "codex-stabilized-2026-06-21-v2"
+
 app = FastAPI()
 
 @app.get("/")
 def home():
-    return {"status": "online", "service": "music-discovery-api"}
+    return {
+        "status": "online",
+        "service": "music-discovery-api",
+        "version": APP_VERSION,
+    }
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": APP_VERSION}
 
 # ===== SUPABASE =====
 supabase = create_client(
@@ -1179,7 +1185,10 @@ def run_pipeline():
 def startup():
     app.state.pipeline_running = False
     app.state.search_discovery_running = set()
-    logger.info("startup: API started; search is live, use POST /run to trigger full discovery")
+    logger.info(
+        "startup: API started version=%s; search is live, use GET/POST /run to trigger full discovery",
+        APP_VERSION,
+    )
 
 
 # ===== ENDPOINTS =====
